@@ -19,7 +19,7 @@ const server = new McpServer(
   },
   {
     instructions:
-      "Use capture_lead to save new leads in GoHighLevel. Use send_sms to send follow-up text messages when phone and message are provided."
+      "Use capture_lead to record new leads and send_sms to draft or send follow-up text messages when phone and message are provided."
   }
 );
 
@@ -27,7 +27,7 @@ server.registerTool(
   "capture_lead",
   {
     title: "Capture Lead",
-    description: "Capture a new business lead in GoHighLevel.",
+    description: "Capture a new business lead.",
     inputSchema: z.object({
       name: z.string().min(1),
       phone: z.string().min(1),
@@ -35,59 +35,14 @@ server.registerTool(
     })
   },
   async ({ name, phone, service }) => {
-    if (!process.env.GHL_API_KEY) {
-      return {
-        content: [{ type: "text", text: "Missing GHL_API_KEY in server environment." }],
-        isError: true
-      };
-    }
-
-    try {
-      const ghlResponse = await fetch("https://rest.gohighlevel.com/v1/contacts/", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${process.env.GHL_API_KEY}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          name,
-          phone
-        })
-      });
-
-      if (!ghlResponse.ok) {
-        const errorText = await ghlResponse.text();
-
-        return {
-          content: [
-            {
-              type: "text",
-              text: `GoHighLevel rejected the lead capture request with HTTP ${ghlResponse.status}: ${errorText}`
-            }
-          ],
-          isError: true
-        };
-      }
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Lead captured for ${name} (${phone})${service ? ` for service "${service}"` : ""}.`
-          }
-        ]
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Failed to reach GoHighLevel: ${error instanceof Error ? error.message : String(error)}`
-          }
-        ],
-        isError: true
-      };
-    }
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Lead captured for ${name} (${phone})${service ? ` for service "${service}"` : ""}. No CRM is connected yet.`
+        }
+      ]
+    };
   }
 );
 
@@ -130,7 +85,7 @@ app.get("/.well-known/mcp", (req, res) => {
     tools: [
       {
         name: "capture_lead",
-        description: "Capture a new business lead in GoHighLevel."
+        description: "Capture a new business lead."
       },
       {
         name: "send_sms",
