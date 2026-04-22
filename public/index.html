@@ -31,6 +31,7 @@
           </div>
           <div class="hero-actions">
             <button class="button" data-refresh>Refresh</button>
+            <button class="button button-secondary" data-logout>Log out</button>
           </div>
         </section>
 
@@ -106,6 +107,20 @@
             </form>
             <div id="task-list" class="task-list"></div>
           </section>
+        </section>
+
+        <section class="card">
+          <div class="section-head">
+            <h3>Send SMS</h3>
+            <span class="muted">Twilio-backed follow-up from the CRM</span>
+          </div>
+          <form id="sms-form" class="form">
+            <select name="leadId" id="sms-lead-select"></select>
+            <input name="phone" placeholder="Phone override, optional" />
+            <textarea name="message" placeholder="Your follow-up message"></textarea>
+            <button class="button" type="submit">Send SMS</button>
+          </form>
+          <div id="sms-result" class="results empty">SMS delivery results will appear here.</div>
         </section>
 
         <section class="card">

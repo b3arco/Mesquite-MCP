@@ -1,4 +1,5 @@
 import "dotenv/config";
+import crypto from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import express from "express";
@@ -16,10 +17,14 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const publicDir = path.join(__dirname, "public");
 const leadStatuses = ["new", "qualified", "contacted", "follow_up", "won", "lost"];
+const authCookieName = "mesquite_session";
+const crmUsername = process.env.CRM_USERNAME || "admin";
+const crmPassword = process.env.CRM_PASSWORD || "";
+const sessionSecret = process.env.CRM_SESSION_SECRET || crypto.randomBytes(32).toString("hex");
 
 app.use(cors());
 app.use(express.json());
-app.use(express.static(publicDir));
+app.use(express.static(publicDir, { index: false }));
 
 let pool;
 let schemaReady;
@@ -118,6 +123,115 @@ async function withSchema(callback) {
 
 function normalizeLeadStatus(status) {
   return leadStatuses.includes(status) ? status : "new";
+}
+
+function parseCookies(cookieHeader) {
+  if (!cookieHeader) {
+    return {};
+  }
+
+  return Object.fromEntries(
+    cookieHeader.split(";").map((part) => {
+      const [key, ...rest] = part.trim().split("=");
+      return [key, decodeURIComponent(rest.join("="))];
+    })
+  );
+}
+
+function signSession(value) {
+  return crypto.createHmac("sha256", sessionSecret).update(value).digest("hex");
+}
+
+function createSessionValue(username) {
+  const payload = `${username}:${Date.now()}`;
+  return `${payload}.${signSession(payload)}`;
+}
+
+function isAuthenticated(req) {
+  if (!crmPassword) {
+    return true;
+  }
+
+  const cookies = parseCookies(req.headers.cookie);
+  const raw = cookies[authCookieName];
+
+  if (!raw || !raw.includes(".")) {
+    return false;
+  }
+
+  const lastDot = raw.lastIndexOf(".");
+  const payload = raw.slice(0, lastDot);
+  const signature = raw.slice(lastDot + 1);
+  const expectedSignature = signSession(payload);
+
+  try {
+    const actualBuffer = Buffer.from(signature);
+    const expectedBuffer = Buffer.from(expectedSignature);
+
+    return (
+      actualBuffer.length === expectedBuffer.length &&
+      crypto.timingSafeEqual(actualBuffer, expectedBuffer) &&
+      payload.startsWith(`${crmUsername}:`)
+    );
+  } catch {
+    return false;
+  }
+}
+
+function requireAppAuth(req, res, next) {
+  if (isAuthenticated(req)) {
+    next();
+    return;
+  }
+
+  if (req.path.startsWith("/api/")) {
+    res.status(401).json({ error: "Unauthorized" });
+    return;
+  }
+
+  res.redirect("/login");
+}
+
+async function sendTwilioSms({ phone, message }) {
+  const accountSid = process.env.TWILIO_ACCOUNT_SID;
+  const authToken = process.env.TWILIO_AUTH_TOKEN;
+  const fromNumber = process.env.TWILIO_FROM_NUMBER;
+
+  if (!accountSid || !authToken || !fromNumber) {
+    throw new Error(
+      "Missing Twilio configuration. Set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, and TWILIO_FROM_NUMBER."
+    );
+  }
+
+  const endpoint = `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Messages.json`;
+  const body = new URLSearchParams({
+    To: phone,
+    From: fromNumber,
+    Body: message
+  });
+
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      Authorization: `Basic ${Buffer.from(`${accountSid}:${authToken}`).toString("base64")}`,
+      "Content-Type": "application/x-www-form-urlencoded"
+    },
+    body
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Twilio rejected the SMS request with HTTP ${response.status}: ${errorText}`);
+  }
+
+  const result = await response.json();
+
+  return {
+    sid: result.sid,
+    status: result.status,
+    to: result.to,
+    from: result.from
+  };
 }
 
 async function runApifyActor({ actorId, runInput, limit }) {
@@ -513,15 +627,86 @@ server.registerTool(
       message: z.string().min(1)
     })
   },
-  async ({ phone, message }) => ({
-    content: [
-      {
-        type: "text",
-        text: `Mock SMS sent to ${phone}: ${message}`
-      }
-    ]
-  })
+  async ({ phone, message }) => {
+    try {
+      const result = await sendTwilioSms({ phone, message });
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(result, null, 2)
+          }
+        ]
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: error instanceof Error ? error.message : String(error)
+          }
+        ],
+        isError: true
+      };
+    }
+  }
 );
+
+app.get("/login", (req, res) => {
+  if (isAuthenticated(req)) {
+    res.redirect("/");
+    return;
+  }
+
+  res.sendFile(path.join(publicDir, "login.html"));
+});
+
+app.post("/auth/login", (req, res) => {
+  const username = typeof req.body?.username === "string" ? req.body.username : "";
+  const password = typeof req.body?.password === "string" ? req.body.password : "";
+
+  if (!crmPassword) {
+    res.json({ success: true, bypassed: true });
+    return;
+  }
+
+  if (username !== crmUsername || password !== crmPassword) {
+    res.status(401).json({ error: "Invalid credentials" });
+    return;
+  }
+
+  res.setHeader(
+    "Set-Cookie",
+    `${authCookieName}=${createSessionValue(username)}; Path=/; HttpOnly; SameSite=Lax; Secure`
+  );
+  res.json({ success: true });
+});
+
+app.post("/auth/logout", (req, res) => {
+  res.setHeader(
+    "Set-Cookie",
+    `${authCookieName}=; Path=/; HttpOnly; SameSite=Lax; Secure; Max-Age=0`
+  );
+  res.json({ success: true });
+});
+
+app.use("/api", requireAppAuth);
+app.use("/", (req, res, next) => {
+  if (
+    req.path === "/login" ||
+    req.path === "/index.html" ||
+    req.path === "/app.js" ||
+    req.path === "/styles.css" ||
+    req.path === "/login.js" ||
+    req.path === "/login.css"
+  ) {
+    next();
+    return;
+  }
+
+  requireAppAuth(req, res, next);
+});
 
 app.get("/", (req, res) => {
   res.sendFile(path.join(publicDir, "index.html"));
@@ -627,6 +812,19 @@ app.patch("/api/leads/:leadId/status", async (req, res) => {
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
     res.status(message.startsWith("Lead not found") ? 404 : 500).json({ error: message });
+  }
+});
+
+app.post("/api/sms", async (req, res) => {
+  try {
+    const result = await sendTwilioSms({
+      phone: req.body?.phone,
+      message: req.body?.message
+    });
+
+    res.status(201).json(result);
+  } catch (error) {
+    res.status(500).json({ error: error instanceof Error ? error.message : "Unknown error" });
   }
 });
 

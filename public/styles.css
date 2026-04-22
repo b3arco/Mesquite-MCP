@@ -126,6 +126,12 @@ body {
   font-family: inherit;
 }
 
+.button-secondary {
+  background: rgba(255, 255, 255, 0.82);
+  color: var(--ink);
+  border: 1px solid var(--line);
+}
+
 .stats,
 .grid.two-up {
   display: grid;

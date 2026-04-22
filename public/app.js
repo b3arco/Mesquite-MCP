@@ -8,11 +8,17 @@ const taskListEl = document.querySelector("#task-list");
 const eventListEl = document.querySelector("#event-list");
 const taskLeadSelectEl = document.querySelector("#task-lead-select");
 const scrapeResultsEl = document.querySelector("#scrape-results");
+const smsLeadSelectEl = document.querySelector("#sms-lead-select");
+const smsResultEl = document.querySelector("#sms-result");
+
+let lastScrapeItems = [];
 
 document.querySelector("[data-refresh]").addEventListener("click", () => loadDashboard());
+document.querySelector("[data-logout]").addEventListener("click", handleLogout);
 document.querySelector("#lead-form").addEventListener("submit", handleLeadSubmit);
 document.querySelector("#task-form").addEventListener("submit", handleTaskSubmit);
 document.querySelector("#scrape-form").addEventListener("submit", handleScrapeSubmit);
+document.querySelector("#sms-form").addEventListener("submit", handleSmsSubmit);
 
 async function api(path, options = {}) {
   const response = await fetch(path, {
@@ -143,12 +149,15 @@ function renderEvents() {
 }
 
 function hydrateLeadSelect() {
-  taskLeadSelectEl.innerHTML = state.data.leads
+  const options = state.data.leads
     .map(
       (lead) =>
         `<option value="${lead.id}">${escapeHtml(lead.name || lead.company || lead.email || lead.id)}</option>`
     )
     .join("");
+
+  taskLeadSelectEl.innerHTML = options;
+  smsLeadSelectEl.innerHTML = options;
 }
 
 async function handleLeadSubmit(event) {
@@ -219,10 +228,92 @@ async function handleScrapeSubmit(event) {
       })
     });
 
-    scrapeResultsEl.innerHTML = `<pre>${escapeHtml(JSON.stringify(result, null, 2))}</pre>`;
+    lastScrapeItems = Array.isArray(result.items) ? result.items : [];
+    renderScrapeResults(lastScrapeItems);
   } catch (error) {
     scrapeResultsEl.innerHTML = `<div class="empty">${escapeHtml(error.message)}</div>`;
   }
+}
+
+function renderScrapeResults(items) {
+  if (!items.length) {
+    scrapeResultsEl.innerHTML = `<div class="empty">No scrape results returned.</div>`;
+    return;
+  }
+
+  scrapeResultsEl.innerHTML = items
+    .map((item, index) => {
+      const name = item.title || item.name || item.companyName || item.businessName || "Lead result";
+      const company = item.companyName || item.businessName || item.displayedUrl || item.url || "";
+      const contact = item.phone || item.email || item.url || "";
+
+      return `
+        <article class="lead-card">
+          <h5>${escapeHtml(name)}</h5>
+          <p class="lead-meta">${escapeHtml(company)}</p>
+          <p class="lead-meta">${escapeHtml(contact)}</p>
+          <div class="lead-actions">
+            <button data-save-scrape="${index}">Save to CRM</button>
+          </div>
+        </article>
+      `;
+    })
+    .join("");
+
+  scrapeResultsEl.querySelectorAll("[data-save-scrape]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const item = lastScrapeItems[Number(button.dataset.saveScrape)];
+      await api("/api/leads", {
+        method: "POST",
+        body: JSON.stringify(mapScrapeItemToLead(item))
+      });
+      await loadDashboard();
+    });
+  });
+}
+
+function mapScrapeItemToLead(item) {
+  return {
+    name: item.title || item.name || item.companyName || item.businessName || null,
+    company: item.companyName || item.businessName || item.title || null,
+    email: item.email || null,
+    phone: item.phone || null,
+    website: item.url || item.website || null,
+    source: "apify",
+    notes: item.description || item.snippet || "Imported from Apify scrape",
+    tags: ["apify-import"],
+    metadata: item
+  };
+}
+
+async function handleSmsSubmit(event) {
+  event.preventDefault();
+  const form = new FormData(event.currentTarget);
+  const selectedLead = state.data.leads.find((lead) => lead.id === form.get("leadId"));
+  const phone = form.get("phone") || selectedLead?.phone;
+
+  smsResultEl.className = "results";
+  smsResultEl.innerHTML = "Sending SMS...";
+
+  try {
+    const result = await api("/api/sms", {
+      method: "POST",
+      body: JSON.stringify({
+        phone,
+        message: form.get("message")
+      })
+    });
+
+    smsResultEl.innerHTML = `<pre>${escapeHtml(JSON.stringify(result, null, 2))}</pre>`;
+    event.currentTarget.reset();
+  } catch (error) {
+    smsResultEl.innerHTML = `<div class="empty">${escapeHtml(error.message)}</div>`;
+  }
+}
+
+async function handleLogout() {
+  await fetch("/auth/logout", { method: "POST" });
+  window.location.href = "/login";
 }
 
 function escapeHtml(value) {
