@@ -1,7 +1,5 @@
 import "dotenv/config";
 import crypto from "node:crypto";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
 import express from "express";
 import cors from "cors";
 import { createMcpExpressApp } from "@modelcontextprotocol/express";
@@ -13,18 +11,10 @@ import * as z from "zod";
 const app = createMcpExpressApp({ host: "0.0.0.0" });
 const port = Number(process.env.PORT) || 3000;
 const { Pool } = pg;
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-const publicDir = path.join(__dirname, "public");
 const leadStatuses = ["new", "qualified", "contacted", "follow_up", "won", "lost"];
-const authCookieName = "mesquite_session";
-const crmUsername = process.env.CRM_USERNAME || "admin";
-const crmPassword = process.env.CRM_PASSWORD || "";
-const sessionSecret = process.env.CRM_SESSION_SECRET || crypto.randomBytes(32).toString("hex");
 
 app.use(cors());
 app.use(express.json());
-app.use(express.static(publicDir, { index: false }));
 
 let pool;
 let schemaReady;
@@ -123,73 +113,6 @@ async function withSchema(callback) {
 
 function normalizeLeadStatus(status) {
   return leadStatuses.includes(status) ? status : "new";
-}
-
-function parseCookies(cookieHeader) {
-  if (!cookieHeader) {
-    return {};
-  }
-
-  return Object.fromEntries(
-    cookieHeader.split(";").map((part) => {
-      const [key, ...rest] = part.trim().split("=");
-      return [key, decodeURIComponent(rest.join("="))];
-    })
-  );
-}
-
-function signSession(value) {
-  return crypto.createHmac("sha256", sessionSecret).update(value).digest("hex");
-}
-
-function createSessionValue(username) {
-  const payload = `${username}:${Date.now()}`;
-  return `${payload}.${signSession(payload)}`;
-}
-
-function isAuthenticated(req) {
-  if (!crmPassword) {
-    return true;
-  }
-
-  const cookies = parseCookies(req.headers.cookie);
-  const raw = cookies[authCookieName];
-
-  if (!raw || !raw.includes(".")) {
-    return false;
-  }
-
-  const lastDot = raw.lastIndexOf(".");
-  const payload = raw.slice(0, lastDot);
-  const signature = raw.slice(lastDot + 1);
-  const expectedSignature = signSession(payload);
-
-  try {
-    const actualBuffer = Buffer.from(signature);
-    const expectedBuffer = Buffer.from(expectedSignature);
-
-    return (
-      actualBuffer.length === expectedBuffer.length &&
-      crypto.timingSafeEqual(actualBuffer, expectedBuffer) &&
-      payload.startsWith(`${crmUsername}:`)
-    );
-  } catch {
-    return false;
-  }
-}
-
-function requireAppAuth(req, res, next) {
-  if (isAuthenticated(req)) {
-    next();
-    return;
-  }
-
-  if (req.path.startsWith("/api/")) {
-    res.status(401).json({ error: "Unauthorized" });
-    return;
-  }
-
-  res.redirect("/login");
 }
 
 async function sendTwilioSms({ phone, message }) {
@@ -719,63 +642,22 @@ server.registerTool(
   }
 );
 
-app.get("/login", (req, res) => {
-  if (isAuthenticated(req)) {
-    res.redirect("/");
-    return;
-  }
-
-  res.sendFile(path.join(publicDir, "login.html"));
-});
-
-app.post("/auth/login", (req, res) => {
-  const username = typeof req.body?.username === "string" ? req.body.username : "";
-  const password = typeof req.body?.password === "string" ? req.body.password : "";
-
-  if (!crmPassword) {
-    res.json({ success: true, bypassed: true });
-    return;
-  }
-
-  if (username !== crmUsername || password !== crmPassword) {
-    res.status(401).json({ error: "Invalid credentials" });
-    return;
-  }
-
-  res.setHeader(
-    "Set-Cookie",
-    `${authCookieName}=${createSessionValue(username)}; Path=/; HttpOnly; SameSite=Lax; Secure`
-  );
-  res.json({ success: true });
-});
-
-app.post("/auth/logout", (req, res) => {
-  res.setHeader(
-    "Set-Cookie",
-    `${authCookieName}=; Path=/; HttpOnly; SameSite=Lax; Secure; Max-Age=0`
-  );
-  res.json({ success: true });
-});
-
-app.use("/api", requireAppAuth);
-app.use("/", (req, res, next) => {
-  if (
-    req.path === "/login" ||
-    req.path === "/index.html" ||
-    req.path === "/app.js" ||
-    req.path === "/styles.css" ||
-    req.path === "/login.js" ||
-    req.path === "/login.css"
-  ) {
-    next();
-    return;
-  }
-
-  requireAppAuth(req, res, next);
-});
-
 app.get("/", (req, res) => {
-  res.sendFile(path.join(publicDir, "index.html"));
+  res.json({
+    name: "mesquite-mcp",
+    status: "ok",
+    endpoints: [
+      "/.well-known/mcp",
+      "/api/health",
+      "/api/leads",
+      "/api/tasks",
+      "/api/scrape",
+      "/api/sms",
+      "/mcp"
+    ],
+    connector_url: `${req.protocol}://${req.get("host")}/mcp`,
+    transport: "streamable-http"
+  });
 });
 
 app.get("/.well-known/mcp", (req, res) => {
