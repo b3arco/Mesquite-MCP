@@ -1,4 +1,6 @@
 import "dotenv/config";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import express from "express";
 import cors from "cors";
 import { createMcpExpressApp } from "@modelcontextprotocol/express";
@@ -10,9 +12,14 @@ import * as z from "zod";
 const app = createMcpExpressApp({ host: "0.0.0.0" });
 const port = Number(process.env.PORT) || 3000;
 const { Pool } = pg;
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const publicDir = path.join(__dirname, "public");
+const leadStatuses = ["new", "qualified", "contacted", "follow_up", "won", "lost"];
 
 app.use(cors());
 app.use(express.json());
+app.use(express.static(publicDir));
 
 let pool;
 let schemaReady;
@@ -109,6 +116,243 @@ async function withSchema(callback) {
   }
 }
 
+function normalizeLeadStatus(status) {
+  return leadStatuses.includes(status) ? status : "new";
+}
+
+async function runApifyActor({ actorId, runInput, limit }) {
+  if (!process.env.APIFY_API_TOKEN) {
+    throw new Error("Missing APIFY_API_TOKEN in server environment.");
+  }
+
+  const resolvedActorId = actorId || process.env.APIFY_LEAD_SCRAPER_ACTOR_ID;
+
+  if (!resolvedActorId) {
+    throw new Error(
+      "Missing actorId. Provide actorId in the request or set APIFY_LEAD_SCRAPER_ACTOR_ID in the server environment."
+    );
+  }
+
+  const url = new URL(
+    `https://api.apify.com/v2/acts/${encodeURIComponent(resolvedActorId)}/run-sync-get-dataset-items`
+  );
+
+  if (limit) {
+    url.searchParams.set("limit", String(limit));
+  }
+
+  const apifyResponse = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${process.env.APIFY_API_TOKEN}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(runInput ?? {})
+  });
+
+  if (!apifyResponse.ok) {
+    const errorText = await apifyResponse.text();
+    throw new Error(`Apify rejected the scrape request with HTTP ${apifyResponse.status}: ${errorText}`);
+  }
+
+  const items = await apifyResponse.json();
+
+  return {
+    actorId: resolvedActorId,
+    count: Array.isArray(items) ? items.length : 0,
+    items
+  };
+}
+
+async function createLead(input) {
+  const id = crypto.randomUUID();
+  const eventId = crypto.randomUUID();
+  const status = normalizeLeadStatus(input.status ?? "new");
+
+  await getPool().query(
+    `
+      insert into leads (
+        id, name, company, email, phone, website, source, service, status, tags, notes, metadata
+      ) values (
+        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb
+      )
+    `,
+    [
+      id,
+      input.name ?? null,
+      input.company ?? null,
+      input.email ?? null,
+      input.phone ?? null,
+      input.website ?? null,
+      input.source ?? null,
+      input.service ?? null,
+      status,
+      input.tags ?? [],
+      input.notes ?? null,
+      JSON.stringify(input.metadata ?? {})
+    ]
+  );
+
+  await getPool().query(
+    `
+      insert into lead_events (id, lead_id, event_type, body, metadata)
+      values ($1, $2, 'lead_created', $3, $4::jsonb)
+    `,
+    [eventId, id, input.notes ?? "Lead saved", JSON.stringify({ source: input.source ?? null })]
+  );
+
+  return { success: true, leadId: id, status };
+}
+
+async function fetchLeads({ status, search, limit = 25 }) {
+  const params = [];
+  const clauses = [];
+
+  if (status) {
+    params.push(status);
+    clauses.push(`status = $${params.length}`);
+  }
+
+  if (search) {
+    params.push(`%${search}%`);
+    clauses.push(
+      `(coalesce(name, '') ilike $${params.length} or coalesce(company, '') ilike $${params.length} or coalesce(email, '') ilike $${params.length} or coalesce(phone, '') ilike $${params.length})`
+    );
+  }
+
+  params.push(limit);
+
+  const whereClause = clauses.length ? `where ${clauses.join(" and ")}` : "";
+  const { rows } = await getPool().query(
+    `
+      select id, name, company, email, phone, website, source, service, status, tags, notes, metadata, created_at, updated_at
+      from leads
+      ${whereClause}
+      order by updated_at desc
+      limit $${params.length}
+    `,
+    params
+  );
+
+  return { count: rows.length, leads: rows };
+}
+
+async function changeLeadStatus({ leadId, status, note }) {
+  const normalizedStatus = normalizeLeadStatus(status);
+  const updateResult = await getPool().query(
+    `
+      update leads
+      set status = $2, updated_at = now()
+      where id = $1
+      returning id, status, updated_at
+    `,
+    [leadId, normalizedStatus]
+  );
+
+  if (!updateResult.rowCount) {
+    throw new Error(`Lead not found: ${leadId}`);
+  }
+
+  await getPool().query(
+    `
+      insert into lead_events (id, lead_id, event_type, body, metadata)
+      values ($1, $2, 'status_updated', $3, $4::jsonb)
+    `,
+    [
+      crypto.randomUUID(),
+      leadId,
+      note ?? `Lead moved to ${normalizedStatus}`,
+      JSON.stringify({ status: normalizedStatus })
+    ]
+  );
+
+  return updateResult.rows[0];
+}
+
+async function createFollowupTask({ leadId, title, channel, dueAt, details }) {
+  const leadCheck = await getPool().query(`select id from leads where id = $1`, [leadId]);
+
+  if (!leadCheck.rowCount) {
+    throw new Error(`Lead not found: ${leadId}`);
+  }
+
+  const taskId = crypto.randomUUID();
+  const { rows } = await getPool().query(
+    `
+      insert into followup_tasks (id, lead_id, title, channel, due_at, details)
+      values ($1, $2, $3, $4, $5, $6)
+      returning id, lead_id as "leadId", title, status, channel, due_at as "dueAt", details, created_at as "createdAt"
+    `,
+    [taskId, leadId, title, channel ?? null, dueAt ?? null, details ?? null]
+  );
+
+  await getPool().query(
+    `
+      insert into lead_events (id, lead_id, event_type, body, metadata)
+      values ($1, $2, 'followup_created', $3, $4::jsonb)
+    `,
+    [
+      crypto.randomUUID(),
+      leadId,
+      title,
+      JSON.stringify({ channel: channel ?? null, dueAt: dueAt ?? null })
+    ]
+  );
+
+  return rows[0];
+}
+
+async function fetchDashboardData() {
+  const [{ rows: leads }, { rows: tasks }, { rows: counts }, { rows: recentEvents }] = await Promise.all([
+    getPool().query(
+      `
+        select id, name, company, email, phone, website, source, service, status, tags, notes, created_at, updated_at
+        from leads
+        order by updated_at desc
+        limit 100
+      `
+    ),
+    getPool().query(
+      `
+        select t.id, t.lead_id as "leadId", t.title, t.status, t.channel, t.due_at as "dueAt", t.details,
+               l.name as "leadName", l.company as "leadCompany"
+        from followup_tasks t
+        join leads l on l.id = t.lead_id
+        order by coalesce(t.due_at, t.created_at) asc
+        limit 100
+      `
+    ),
+    getPool().query(
+      `
+        select status, count(*)::int as count
+        from leads
+        group by status
+      `
+    ),
+    getPool().query(
+      `
+        select e.id, e.lead_id as "leadId", e.event_type as "eventType", e.body, e.created_at as "createdAt",
+               l.name as "leadName", l.company as "leadCompany"
+        from lead_events e
+        join leads l on l.id = e.lead_id
+        order by e.created_at desc
+        limit 20
+      `
+    )
+  ]);
+
+  return {
+    leads,
+    tasks,
+    counts: leadStatuses.map((status) => ({
+      status,
+      count: counts.find((row) => row.status === status)?.count ?? 0
+    })),
+    recentEvents,
+    statuses: leadStatuses
+  };
+}
+
 const server = new McpServer(
   {
     name: "mesquite-mcp",
@@ -132,75 +376,14 @@ server.registerTool(
     })
   },
   async ({ actorId, runInput, limit }) => {
-    if (!process.env.APIFY_API_TOKEN) {
-      return {
-        content: [{ type: "text", text: "Missing APIFY_API_TOKEN in server environment." }],
-        isError: true
-      };
-    }
-
-    const resolvedActorId = actorId || process.env.APIFY_LEAD_SCRAPER_ACTOR_ID;
-
-    if (!resolvedActorId) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: "Missing actorId. Provide actorId in the tool call or set APIFY_LEAD_SCRAPER_ACTOR_ID in the server environment."
-          }
-        ],
-        isError: true
-      };
-    }
-
-    const url = new URL(
-      `https://api.apify.com/v2/acts/${encodeURIComponent(resolvedActorId)}/run-sync-get-dataset-items`
-    );
-
-    if (limit) {
-      url.searchParams.set("limit", String(limit));
-    }
-
     try {
-      const apifyResponse = await fetch(url, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${process.env.APIFY_API_TOKEN}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify(runInput ?? {})
-      });
-
-      if (!apifyResponse.ok) {
-        const errorText = await apifyResponse.text();
-
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Apify rejected the scrape request with HTTP ${apifyResponse.status}: ${errorText}`
-            }
-          ],
-          isError: true
-        };
-      }
-
-      const items = await apifyResponse.json();
-      const count = Array.isArray(items) ? items.length : 0;
+      const result = await runApifyActor({ actorId, runInput, limit });
 
       return {
         content: [
           {
             type: "text",
-            text: JSON.stringify(
-              {
-                actorId: resolvedActorId,
-                count,
-                items
-              },
-              null,
-              2
-            )
+            text: JSON.stringify(result, null, 2)
           }
         ]
       };
@@ -209,7 +392,7 @@ server.registerTool(
         content: [
           {
             type: "text",
-            text: `Failed to reach Apify: ${error instanceof Error ? error.message : String(error)}`
+            text: error instanceof Error ? error.message : String(error)
           }
         ],
         isError: true
@@ -238,51 +421,14 @@ server.registerTool(
     })
   },
   async (input) =>
-    withSchema(async () => {
-      const id = crypto.randomUUID();
-      const eventId = crypto.randomUUID();
-
-      await getPool().query(
-        `
-          insert into leads (
-            id, name, company, email, phone, website, source, service, status, tags, notes, metadata
-          ) values (
-            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb
-          )
-        `,
-        [
-          id,
-          input.name ?? null,
-          input.company ?? null,
-          input.email ?? null,
-          input.phone ?? null,
-          input.website ?? null,
-          input.source ?? null,
-          input.service ?? null,
-          input.status,
-          input.tags,
-          input.notes ?? null,
-          JSON.stringify(input.metadata)
-        ]
-      );
-
-      await getPool().query(
-        `
-          insert into lead_events (id, lead_id, event_type, body, metadata)
-          values ($1, $2, 'lead_created', $3, $4::jsonb)
-        `,
-        [eventId, id, input.notes ?? "Lead saved", JSON.stringify({ source: input.source ?? null })]
-      );
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({ success: true, leadId: id, status: input.status }, null, 2)
-          }
-        ]
-      };
-    })
+    withSchema(async () => ({
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(await createLead(input), null, 2)
+        }
+      ]
+    }))
 );
 
 server.registerTool(
@@ -297,45 +443,14 @@ server.registerTool(
     })
   },
   async ({ status, search, limit }) =>
-    withSchema(async () => {
-      const params = [];
-      const clauses = [];
-
-      if (status) {
-        params.push(status);
-        clauses.push(`status = $${params.length}`);
-      }
-
-      if (search) {
-        params.push(`%${search}%`);
-        clauses.push(
-          `(coalesce(name, '') ilike $${params.length} or coalesce(company, '') ilike $${params.length} or coalesce(email, '') ilike $${params.length} or coalesce(phone, '') ilike $${params.length})`
-        );
-      }
-
-      params.push(limit);
-
-      const whereClause = clauses.length ? `where ${clauses.join(" and ")}` : "";
-      const { rows } = await getPool().query(
-        `
-          select id, name, company, email, phone, website, source, service, status, tags, notes, created_at, updated_at
-          from leads
-          ${whereClause}
-          order by updated_at desc
-          limit $${params.length}
-        `,
-        params
-      );
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({ count: rows.length, leads: rows }, null, 2)
-          }
-        ]
-      };
-    })
+    withSchema(async () => ({
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(await fetchLeads({ status, search, limit }), null, 2)
+        }
+      ]
+    }))
 );
 
 server.registerTool(
@@ -350,46 +465,14 @@ server.registerTool(
     })
   },
   async ({ leadId, status, note }) =>
-    withSchema(async () => {
-      const updateResult = await getPool().query(
-        `
-          update leads
-          set status = $2, updated_at = now()
-          where id = $1
-          returning id, status, updated_at
-        `,
-        [leadId, status]
-      );
-
-      if (!updateResult.rowCount) {
-        return {
-          content: [{ type: "text", text: `Lead not found: ${leadId}` }],
-          isError: true
-        };
-      }
-
-      await getPool().query(
-        `
-          insert into lead_events (id, lead_id, event_type, body, metadata)
-          values ($1, $2, 'status_updated', $3, $4::jsonb)
-        `,
-        [
-          crypto.randomUUID(),
-          leadId,
-          note ?? `Lead moved to ${status}`,
-          JSON.stringify({ status })
-        ]
-      );
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(updateResult.rows[0], null, 2)
-          }
-        ]
-      };
-    })
+    withSchema(async () => ({
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(await changeLeadStatus({ leadId, status, note }), null, 2)
+        }
+      ]
+    }))
 );
 
 server.registerTool(
@@ -406,48 +489,18 @@ server.registerTool(
     })
   },
   async ({ leadId, title, channel, dueAt, details }) =>
-    withSchema(async () => {
-      const leadCheck = await getPool().query(`select id from leads where id = $1`, [leadId]);
-
-      if (!leadCheck.rowCount) {
-        return {
-          content: [{ type: "text", text: `Lead not found: ${leadId}` }],
-          isError: true
-        };
-      }
-
-      const taskId = crypto.randomUUID();
-      const { rows } = await getPool().query(
-        `
-          insert into followup_tasks (id, lead_id, title, channel, due_at, details)
-          values ($1, $2, $3, $4, $5, $6)
-          returning id, lead_id as "leadId", title, status, channel, due_at as "dueAt", details, created_at as "createdAt"
-        `,
-        [taskId, leadId, title, channel ?? null, dueAt ?? null, details ?? null]
-      );
-
-      await getPool().query(
-        `
-          insert into lead_events (id, lead_id, event_type, body, metadata)
-          values ($1, $2, 'followup_created', $3, $4::jsonb)
-        `,
-        [
-          crypto.randomUUID(),
-          leadId,
-          title,
-          JSON.stringify({ channel: channel ?? null, dueAt: dueAt ?? null })
-        ]
-      );
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(rows[0], null, 2)
-          }
-        ]
-      };
-    })
+    withSchema(async () => ({
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            await createFollowupTask({ leadId, title, channel, dueAt, details }),
+            null,
+            2
+          )
+        }
+      ]
+    }))
 );
 
 server.registerTool(
@@ -471,13 +524,7 @@ server.registerTool(
 );
 
 app.get("/", (req, res) => {
-  res.json({
-    name: "mesquite-mcp",
-    status: "ok",
-    endpoints: ["/.well-known/mcp", "/mcp"],
-    connector_url: "/mcp",
-    transport: "streamable-http"
-  });
+  res.sendFile(path.join(publicDir, "index.html"));
 });
 
 app.get("/.well-known/mcp", (req, res) => {
@@ -513,6 +560,92 @@ app.get("/.well-known/mcp", (req, res) => {
       }
     ]
   });
+});
+
+app.get("/api/health", async (req, res) => {
+  try {
+    await ensureSchema();
+
+    res.json({
+      name: "mesquite-mcp-crm",
+      status: "ok",
+      endpoints: ["/api/dashboard", "/api/leads", "/api/tasks", "/api/scrape", "/mcp"],
+      connector_url: "/mcp",
+      transport: "streamable-http"
+    });
+  } catch (error) {
+    res.status(500).json({
+      status: "error",
+      message: error instanceof Error ? error.message : "Unknown error"
+    });
+  }
+});
+
+app.get("/api/dashboard", async (req, res) => {
+  try {
+    await ensureSchema();
+    res.json(await fetchDashboardData());
+  } catch (error) {
+    res.status(500).json({ error: error instanceof Error ? error.message : "Unknown error" });
+  }
+});
+
+app.get("/api/leads", async (req, res) => {
+  try {
+    await ensureSchema();
+    res.json(
+      await fetchLeads({
+        status: typeof req.query.status === "string" ? req.query.status : undefined,
+        search: typeof req.query.search === "string" ? req.query.search : undefined,
+        limit: typeof req.query.limit === "string" ? Number(req.query.limit) : 50
+      })
+    );
+  } catch (error) {
+    res.status(500).json({ error: error instanceof Error ? error.message : "Unknown error" });
+  }
+});
+
+app.post("/api/leads", async (req, res) => {
+  try {
+    await ensureSchema();
+    res.status(201).json(await createLead(req.body ?? {}));
+  } catch (error) {
+    res.status(500).json({ error: error instanceof Error ? error.message : "Unknown error" });
+  }
+});
+
+app.patch("/api/leads/:leadId/status", async (req, res) => {
+  try {
+    await ensureSchema();
+    res.json(
+      await changeLeadStatus({
+        leadId: req.params.leadId,
+        status: req.body?.status,
+        note: req.body?.note
+      })
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+    res.status(message.startsWith("Lead not found") ? 404 : 500).json({ error: message });
+  }
+});
+
+app.post("/api/tasks", async (req, res) => {
+  try {
+    await ensureSchema();
+    res.status(201).json(await createFollowupTask(req.body ?? {}));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+    res.status(message.startsWith("Lead not found") ? 404 : 500).json({ error: message });
+  }
+});
+
+app.post("/api/scrape", async (req, res) => {
+  try {
+    res.json(await runApifyActor(req.body ?? {}));
+  } catch (error) {
+    res.status(500).json({ error: error instanceof Error ? error.message : "Unknown error" });
+  }
 });
 
 app.post("/mcp", async (req, res) => {

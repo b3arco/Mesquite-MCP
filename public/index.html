@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Mesquite CRM</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark">M</div>
+          <div>
+            <h1>Mesquite CRM</h1>
+            <p>Apify + MCP + Postgres</p>
+          </div>
+        </div>
+        <nav class="nav">
+          <a href="#dashboard">Dashboard</a>
+          <a href="#pipeline">Pipeline</a>
+          <a href="#scraper">Scraper</a>
+          <a href="#tasks">Tasks</a>
+        </nav>
+      </aside>
+      <main class="main">
+        <section class="hero" id="dashboard">
+          <div>
+            <p class="eyebrow">All-in-one CRM</p>
+            <h2>Source leads with Apify, manage them here, and expose the same system to Claude over MCP.</h2>
+          </div>
+          <div class="hero-actions">
+            <button class="button" data-refresh>Refresh</button>
+          </div>
+        </section>
+
+        <section class="stats" id="stats"></section>
+
+        <section class="grid two-up">
+          <section class="card" id="pipeline">
+            <div class="section-head">
+              <h3>Lead Pipeline</h3>
+              <span class="muted">Fast triage by stage</span>
+            </div>
+            <div id="pipeline-board" class="pipeline-board"></div>
+          </section>
+
+          <section class="card">
+            <div class="section-head">
+              <h3>Add Lead</h3>
+              <span class="muted">Manual intake or save scraped prospects</span>
+            </div>
+            <form id="lead-form" class="form">
+              <input name="name" placeholder="Lead name" />
+              <input name="company" placeholder="Company" />
+              <input name="email" placeholder="Email" />
+              <input name="phone" placeholder="Phone" />
+              <input name="website" placeholder="Website" />
+              <input name="service" placeholder="Service" />
+              <input name="source" placeholder="Source" value="manual" />
+              <input name="tags" placeholder="Tags (comma separated)" />
+              <select name="status">
+                <option value="new">new</option>
+                <option value="qualified">qualified</option>
+                <option value="contacted">contacted</option>
+                <option value="follow_up">follow_up</option>
+                <option value="won">won</option>
+                <option value="lost">lost</option>
+              </select>
+              <textarea name="notes" placeholder="Notes"></textarea>
+              <button class="button" type="submit">Save lead</button>
+            </form>
+          </section>
+        </section>
+
+        <section class="grid two-up">
+          <section class="card" id="scraper">
+            <div class="section-head">
+              <h3>Apify Lead Scraper</h3>
+              <span class="muted">Run your actor without leaving the CRM</span>
+            </div>
+            <form id="scrape-form" class="form">
+              <input name="actorId" placeholder="Actor ID (optional if env default exists)" />
+              <input name="query" placeholder="Query, e.g. roofing companies in Phoenix AZ" />
+              <input name="countryCode" placeholder="Country code" value="us" />
+              <input name="languageCode" placeholder="Language code" value="en" />
+              <input name="maxPagesPerQuery" placeholder="Max pages per query" value="2" />
+              <input name="limit" placeholder="Return item limit" value="10" />
+              <button class="button" type="submit">Run scrape</button>
+            </form>
+            <div id="scrape-results" class="results empty">Scrape results will appear here.</div>
+          </section>
+
+          <section class="card" id="tasks">
+            <div class="section-head">
+              <h3>Follow-up Tasks</h3>
+              <span class="muted">Create next actions tied to a lead</span>
+            </div>
+            <form id="task-form" class="form">
+              <select name="leadId" id="task-lead-select"></select>
+              <input name="title" placeholder="Task title" />
+              <input name="channel" placeholder="Channel, e.g. sms or email" />
+              <input name="dueAt" placeholder="Due date ISO, optional" />
+              <textarea name="details" placeholder="Task details"></textarea>
+              <button class="button" type="submit">Create task</button>
+            </form>
+            <div id="task-list" class="task-list"></div>
+          </section>
+        </section>
+
+        <section class="card">
+          <div class="section-head">
+            <h3>Recent Activity</h3>
+            <span class="muted">Lead changes and follow-up events</span>
+          </div>
+          <div id="event-list" class="event-list"></div>
+        </section>
+      </main>
+    </div>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
