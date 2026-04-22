@@ -318,6 +318,72 @@ async function createLead(input) {
   return { success: true, leadId: id, status };
 }
 
+async function updateLead(leadId, input) {
+  const status = normalizeLeadStatus(input.status ?? "new");
+  const updateResult = await getPool().query(
+    `
+      update leads
+      set name = $2,
+          company = $3,
+          email = $4,
+          phone = $5,
+          website = $6,
+          source = $7,
+          service = $8,
+          status = $9,
+          tags = $10,
+          notes = $11,
+          metadata = $12::jsonb,
+          updated_at = now()
+      where id = $1
+      returning id, name, company, email, phone, website, source, service, status, tags, notes, metadata, updated_at
+    `,
+    [
+      leadId,
+      input.name ?? null,
+      input.company ?? null,
+      input.email ?? null,
+      input.phone ?? null,
+      input.website ?? null,
+      input.source ?? null,
+      input.service ?? null,
+      status,
+      input.tags ?? [],
+      input.notes ?? null,
+      JSON.stringify(input.metadata ?? {})
+    ]
+  );
+
+  if (!updateResult.rowCount) {
+    throw new Error(`Lead not found: ${leadId}`);
+  }
+
+  await getPool().query(
+    `
+      insert into lead_events (id, lead_id, event_type, body, metadata)
+      values ($1, $2, 'lead_updated', $3, $4::jsonb)
+    `,
+    [
+      crypto.randomUUID(),
+      leadId,
+      input.notes ?? "Lead updated",
+      JSON.stringify({ status })
+    ]
+  );
+
+  return updateResult.rows[0];
+}
+
+async function deleteLead(leadId) {
+  const deleteResult = await getPool().query(`delete from leads where id = $1 returning id`, [leadId]);
+
+  if (!deleteResult.rowCount) {
+    throw new Error(`Lead not found: ${leadId}`);
+  }
+
+  return { success: true, leadId };
+}
+
 async function fetchLeads({ status, search, limit = 25 }) {
   const params = [];
   const clauses = [];
@@ -799,6 +865,16 @@ app.post("/api/leads", async (req, res) => {
   }
 });
 
+app.put("/api/leads/:leadId", async (req, res) => {
+  try {
+    await ensureSchema();
+    res.json(await updateLead(req.params.leadId, req.body ?? {}));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+    res.status(message.startsWith("Lead not found") ? 404 : 500).json({ error: message });
+  }
+});
+
 app.patch("/api/leads/:leadId/status", async (req, res) => {
   try {
     await ensureSchema();
@@ -809,6 +885,16 @@ app.patch("/api/leads/:leadId/status", async (req, res) => {
         note: req.body?.note
       })
     );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+    res.status(message.startsWith("Lead not found") ? 404 : 500).json({ error: message });
+  }
+});
+
+app.delete("/api/leads/:leadId", async (req, res) => {
+  try {
+    await ensureSchema();
+    res.json(await deleteLead(req.params.leadId));
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
     res.status(message.startsWith("Lead not found") ? 404 : 500).json({ error: message });

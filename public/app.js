@@ -83,7 +83,13 @@ function renderPipeline() {
             .map(
               (lead) => `
                 <article class="lead-card">
-                  <h5>${escapeHtml(lead.name || "Unnamed lead")}</h5>
+                  <div class="lead-card-top">
+                    <h5>${escapeHtml(lead.name || "Unnamed lead")}</h5>
+                    <div class="lead-card-controls">
+                      <button class="lead-control" data-edit-lead="${lead.id}">Edit</button>
+                      <button class="lead-control danger" data-delete-lead="${lead.id}">Delete</button>
+                    </div>
+                  </div>
                   <p class="lead-meta">${escapeHtml(lead.company || lead.service || "No company/service yet")}</p>
                   <p class="lead-meta">${escapeHtml(lead.email || lead.phone || lead.website || "No contact info")}</p>
                   <div class="lead-actions">
@@ -115,6 +121,52 @@ function renderPipeline() {
         method: "PATCH",
         body: JSON.stringify({ status: button.dataset.nextStatus })
       });
+      await loadDashboard();
+    });
+  });
+
+  boardEl.querySelectorAll("[data-edit-lead]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const lead = state.data.leads.find((item) => item.id === button.dataset.editLead);
+
+      if (!lead) {
+        return;
+      }
+
+      const name = window.prompt("Lead name", lead.name || "") ?? lead.name;
+      const company = window.prompt("Company", lead.company || "") ?? lead.company;
+      const email = window.prompt("Email", lead.email || "") ?? lead.email;
+      const phone = window.prompt("Phone", lead.phone || "") ?? lead.phone;
+      const website = window.prompt("Website", lead.website || "") ?? lead.website;
+
+      await api(`/api/leads/${lead.id}`, {
+        method: "PUT",
+        body: JSON.stringify({
+          ...lead,
+          name,
+          company,
+          email,
+          phone,
+          website
+        })
+      });
+
+      await loadDashboard();
+    });
+  });
+
+  boardEl.querySelectorAll("[data-delete-lead]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const confirmed = window.confirm("Delete this lead and its follow-up tasks?");
+
+      if (!confirmed) {
+        return;
+      }
+
+      await api(`/api/leads/${button.dataset.deleteLead}`, {
+        method: "DELETE"
+      });
+
       await loadDashboard();
     });
   });
