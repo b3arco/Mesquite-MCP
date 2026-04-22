@@ -68,6 +68,12 @@ function renderStats() {
     .join("");
 }
 
+function getActionStatuses(currentStatus) {
+  const preferredOrder = ["qualified", "contacted", "follow_up", "won", "lost", "new"];
+
+  return preferredOrder.filter((status) => status !== currentStatus);
+}
+
 function renderPipeline() {
   boardEl.innerHTML = state.data.statuses
     .map((status) => {
@@ -81,9 +87,7 @@ function renderPipeline() {
                   <p class="lead-meta">${escapeHtml(lead.company || lead.service || "No company/service yet")}</p>
                   <p class="lead-meta">${escapeHtml(lead.email || lead.phone || lead.website || "No contact info")}</p>
                   <div class="lead-actions">
-                    ${state.data.statuses
-                      .filter((next) => next !== status)
-                      .slice(0, 3)
+                    ${getActionStatuses(status)
                       .map(
                         (next) =>
                           `<button data-lead-status="${lead.id}" data-next-status="${next}">${next.replace("_", " ")}</button>`
